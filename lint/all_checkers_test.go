@@ -1,10 +1,12 @@
 package lint
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/types"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -20,8 +22,53 @@ var (
 	warningDirectiveRE = regexp.MustCompile(`^\s*/// (.*)`)
 )
 
+var ruleList []*Rule
+
+func TestMain(m *testing.M) {
+	// Can't do RuleList call in ordinary init due to initialization
+	// order dependency. There are 2 solutions:
+	//	1. make this package "external" test like "lint_test"
+	//	2. use TestMain to run tests after we assign ruleList, after inits.
+	// We're going with (2) here.
+	ruleList = RuleList()
+	os.Exit(m.Run())
+}
+
+func TestSanity(t *testing.T) {
+	saneRules := ruleList[:0]
+
+	for _, rule := range ruleList {
+		t.Run(rule.Name(), func(t *testing.T) {
+			pkgPath := testdataPkgPath + "/_sanity"
+
+			prog := newProg(t, pkgPath)
+			pkgInfo := prog.Imported[pkgPath]
+
+			ctx := NewContext(prog.Fset, sizes)
+			ctx.SetPackageInfo(&pkgInfo.Info, pkgInfo.Pkg)
+
+			files := prog.Imported[pkgPath].Files
+
+			for _, f := range files {
+				defer func() {
+					r := recover()
+					if r != nil {
+						t.Errorf("unexpected panic: `%v`", r)
+					} else {
+						saneRules = append(saneRules, rule)
+					}
+				}()
+
+				_ = NewChecker(rule, ctx).Check(f)
+			}
+		})
+	}
+
+	ruleList = saneRules
+}
+
 func TestCheckers(t *testing.T) {
-	for _, rule := range RuleList() {
+	for _, rule := range ruleList {
 		t.Run(rule.Name(), func(t *testing.T) {
 			pkgPath := testdataPkgPath + rule.Name()
 
@@ -67,6 +114,40 @@ func checkFiles(t *testing.T, rule *Rule, ctx *Context, prog *loader.Program, pk
 			t.Errorf("unexpected warn: `%s`", l)
 		}
 	}
+}
+
+func TestIncorrectRule(t *testing.T) {
+	func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic on nil rule")
+			}
+			if r != "nil rule given" {
+				t.Fatalf("expected `nil rule given`, got %v", r)
+			}
+		}()
+		NewChecker(nil, nil)
+	}(t)
+
+	func(t *testing.T) {
+		name := "i-don-not-exist"
+
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic on incorrect name")
+			}
+
+			want := fmt.Sprintf("rule %q is undefined", name)
+			if r != want {
+				t.Fatalf("expected `%v`, got %v", want, r)
+			}
+		}()
+
+		r := &Rule{name: name}
+		NewChecker(r, nil)
+	}(t)
 }
 
 func getFilename(prog *loader.Program, f *ast.File) string {
